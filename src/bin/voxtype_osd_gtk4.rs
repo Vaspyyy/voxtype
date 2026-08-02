@@ -362,7 +362,17 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
     // GTK otherwise paints the rectangular application-window background
     // behind Cairo. Keep it transparent so only the rounded pill is visible.
     let css = CssProvider::new();
-    css.load_from_data("window.voxtype-osd { background-color: transparent; box-shadow: none; }");
+    css.load_from_data(
+        "window.voxtype-osd, \
+         window.voxtype-osd.background, \
+         window.voxtype-osd decoration { \
+             background-color: transparent; \
+             background-image: none; \
+             border: none; \
+             box-shadow: none; \
+             outline: none; \
+         }",
+    );
     gtk4::style_context_add_provider_for_display(
         &gtk4::gdk::Display::default().expect("GTK display unavailable"),
         &css,
