@@ -221,6 +221,33 @@ pub fn project_envelope(frames: &[AudioFrame], n_columns: usize) -> Vec<Envelope
     out
 }
 
+/// Reduce the newest audio frames to a compact set of normalized pill-bar
+/// levels. Unlike the full scrolling waveform, this intentionally keeps only
+/// a short recent window and applies a square-root response curve so ordinary
+/// speech remains lively without pinning every bar at full height.
+pub fn project_pill_levels(
+    frames: &[AudioFrame],
+    n_bars: usize,
+    recent_frame_limit: usize,
+    gain: f32,
+) -> Vec<f32> {
+    if n_bars == 0 {
+        return Vec::new();
+    }
+    if frames.is_empty() || recent_frame_limit == 0 {
+        return vec![0.0; n_bars];
+    }
+
+    let start = frames.len().saturating_sub(recent_frame_limit);
+    project_envelope(&frames[start..], n_bars)
+        .into_iter()
+        .map(|column| {
+            let amplitude = column.min.abs().max(column.max.abs());
+            (amplitude * gain.max(0.0)).clamp(0.0, 1.0).sqrt()
+        })
+        .collect()
+}
+
 /// Map a dBFS peak to a normalized 0.0..=1.0 fill level for the meter.
 ///
 /// `floor_dbfs` is the dBFS value that maps to 0.0 (typically -60 dBFS for
@@ -341,6 +368,29 @@ mod tests {
         // Last column: frames 8..=9 -> min = -0.9, max = 0.9
         assert!((cols[4].min - -0.9).abs() < 1e-6);
         assert!((cols[4].max - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pill_levels_are_silent_without_frames() {
+        assert_eq!(project_pill_levels(&[], 5, 20, 1.0), vec![0.0; 5]);
+    }
+
+    #[test]
+    fn pill_levels_use_only_the_recent_window() {
+        let frames = vec![
+            frame(0, -1.0, 1.0, 0.0),
+            frame(1, -0.04, 0.04, -28.0),
+            frame(2, -0.09, 0.09, -21.0),
+        ];
+        let levels = project_pill_levels(&frames, 2, 2, 1.0);
+        assert!(levels.iter().all(|level| *level < 0.5));
+    }
+
+    #[test]
+    fn pill_levels_apply_gain_and_clamp() {
+        let frames = vec![frame(0, -0.25, 0.5, -6.0)];
+        let levels = project_pill_levels(&frames, 1, 1, 4.0);
+        assert_eq!(levels, vec![1.0]);
     }
 
     #[test]

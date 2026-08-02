@@ -1,8 +1,8 @@
 //! `voxtype-osd-gtk4` — GTK4 + gtk4-layer-shell on-screen mic visualizer
 //! for the Voxtype daemon.
 //!
-//! Renders a click-through, layer-shell-anchored window containing the
-//! scrolling waveform plus a segmented peak meter. Audio frames arrive on
+//! Renders a click-through, layer-shell-anchored window containing a compact
+//! rounded-bar dictation pill. Audio frames arrive on
 //! the daemon's audio Unix socket via [`voxtype::osd::ipc::run_ipc_loop`],
 //! decoded into [`AudioFrame`]s by a tokio runtime on a worker thread, and
 //! pushed into a shared [`FrameRing`] + [`PeakHold`]. The GTK side polls a
@@ -15,8 +15,9 @@
 //!
 //! Run with `RUST_LOG=debug` for verbose logs.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,7 +25,7 @@ use cairo::{Context, RectangleInt, Region};
 use clap::Parser;
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, DrawingArea};
+use gtk4::{Application, ApplicationWindow, CssProvider, DrawingArea};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use voxtype::audio::levels::{AudioFrame, FRAME_HZ};
@@ -32,7 +33,7 @@ use voxtype::config::Config as VoxtypeConfig;
 use voxtype::osd::config::{OsdConfig, OsdPosition};
 use voxtype::osd::ipc::{resolve_socket_path, run_ipc_loop, FrameRing, DEFAULT_RING_DEPTH};
 use voxtype::osd::theme::ThemeWatcher;
-use voxtype::osd::visual::{peak_meter_fraction, project_envelope, MeterZone, Palette, PeakHold};
+use voxtype::osd::visual::{project_pill_levels, Palette, PeakHold};
 
 /// Load the `[osd]` section from the voxtype config file, falling back to
 /// `OsdConfig::default()` on any error (file missing, unreadable, parse
@@ -77,11 +78,42 @@ const RENDER_TICK_MS: u32 = 16;
 /// hiding the surface. Matches the BRIEF's "Idle: surface destroyed" rule.
 const IDLE_TIMEOUT_SECS: f32 = 0.15;
 
-/// Number of segments in the vertical peak meter.
-const METER_SEGMENTS: usize = 10;
+/// Number of rounded columns in the compact dictation pill.
+const PILL_BAR_COUNT: usize = 19;
 
-/// dBFS floor for the peak meter (maps to "empty bar").
-const METER_FLOOR_DBFS: f32 = -60.0;
+/// Audio history shown by the bars. At 100 Hz this is just under half a
+/// second, enough to feel fluid without looking like a dense oscilloscope.
+const PILL_RECENT_FRAMES: usize = 44;
+
+/// The old waveform gain was tuned for raw full-height samples. Dial it back
+/// before the pill's response curve so normal speech has useful headroom.
+const PILL_GAIN_SCALE: f32 = 0.45;
+
+struct PillAnimation {
+    levels: Vec<f32>,
+}
+
+#[derive(Clone, Copy)]
+struct PillStyle {
+    palette: Palette,
+    gain: f32,
+    opacity: f64,
+}
+
+impl PillAnimation {
+    fn new() -> Self {
+        Self {
+            levels: vec![0.0; PILL_BAR_COUNT],
+        }
+    }
+
+    fn approach(&mut self, targets: &[f32]) {
+        for (level, target) in self.levels.iter_mut().zip(targets) {
+            let response = if *target > *level { 0.62 } else { 0.24 };
+            *level += (*target - *level) * response;
+        }
+    }
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -327,6 +359,17 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
         .decorated(false)
         .build();
 
+    // GTK otherwise paints the rectangular application-window background
+    // behind Cairo. Keep it transparent so only the rounded pill is visible.
+    let css = CssProvider::new();
+    css.load_from_data("window.voxtype-osd { background-color: transparent; box-shadow: none; }");
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::gdk::Display::default().expect("GTK display unavailable"),
+        &css,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    window.add_css_class("voxtype-osd");
+
     // Layer-shell setup: top layer, no keyboard, anchored per config.
     window.init_layer_shell();
     window.set_layer(Layer::Overlay);
@@ -398,9 +441,15 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
     drawing_area.set_content_width(cfg.width_px as i32);
     drawing_area.set_content_height(cfg.height_px as i32);
     let state_for_draw = state.clone();
-    let gain = cfg.waveform_gain as f64;
+    let style = PillStyle {
+        palette,
+        gain: cfg.waveform_gain,
+        opacity: cfg.opacity as f64,
+    };
+    let animation = Rc::new(RefCell::new(PillAnimation::new()));
+    let animation_for_draw = animation.clone();
     drawing_area.set_draw_func(move |_area, cr, w, h| {
-        draw(cr, w, h, &palette, &state_for_draw, gain);
+        draw(cr, w, h, &state_for_draw, &animation_for_draw, &style);
     });
     window.set_child(Some(&drawing_area));
 
@@ -418,6 +467,7 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
     let redraw_state = state.clone();
     let redraw_area = drawing_area.clone();
     let redraw_window = window.clone();
+    let redraw_animation = animation.clone();
     let last_drawn_seq = Cell::new(0u64);
     // Tracks GTK visibility. Starts true because `window.present()` below maps
     // the surface, the first tick's idle check then hides it.
@@ -436,6 +486,10 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
             if visible.get() {
                 tracing::info!("hiding (idle for {:.2}s)", last_at.elapsed().as_secs_f32());
                 redraw_window.set_visible(false);
+                if let Ok(mut ring) = redraw_state.ring.lock() {
+                    ring.clear();
+                }
+                redraw_animation.borrow_mut().levels.fill(0.0);
                 visible.set(false);
             }
             return glib::ControlFlow::Continue;
@@ -495,14 +549,14 @@ fn apply_click_through(window: &ApplicationWindow) {
     surface.set_input_region(Some(&empty));
 }
 
-/// Render the waveform + peak meter into the given Cairo context.
+/// Render the compact rounded-bar dictation pill into the Cairo context.
 fn draw(
     cr: &Context,
     width: i32,
     height: i32,
-    palette: &Palette,
     state: &Arc<SharedState>,
-    gain: f64,
+    animation: &Rc<RefCell<PillAnimation>>,
+    style: &PillStyle,
 ) {
     let w = width as f64;
     let h = height as f64;
@@ -510,182 +564,105 @@ fn draw(
         return;
     }
 
-    // Clear background.
-    cr.set_source_rgba(
-        palette.background.r as f64,
-        palette.background.g as f64,
-        palette.background.b as f64,
-        palette.background.a as f64,
-    );
-    cr.set_operator(cairo::Operator::Source);
+    // Clear the transparent layer surface before painting the floating shape.
+    cr.set_operator(cairo::Operator::Clear);
     cr.paint().ok();
     cr.set_operator(cairo::Operator::Over);
 
-    // Layout: waveform area on the left (~92% width), gap (1%), then peak
-    // meter on the right (~7% width).
-    let meter_width = (w * 0.07).max(8.0);
-    let gap = (w * 0.01).max(2.0);
-    let wave_width = (w - meter_width - gap).max(0.0);
+    // A small inset leaves room for antialiasing and a restrained drop shadow.
+    let inset = 2.0;
+    let pill_x = inset;
+    let pill_y = inset;
+    let pill_w = (w - inset * 2.0).max(1.0);
+    let pill_h = (h - inset * 2.0).max(1.0);
+    let radius = pill_h * 0.5;
 
-    draw_waveform(cr, 0.0, 0.0, wave_width, h, palette, state, gain);
-    draw_peak_meter(cr, wave_width + gap, 0.0, meter_width, h, palette, state);
-}
+    rounded_rectangle(cr, pill_x, pill_y + 1.0, pill_w, pill_h, radius);
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.22 * style.opacity.clamp(0.0, 1.0));
+    cr.fill().ok();
 
-fn draw_waveform(
-    cr: &Context,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    palette: &Palette,
-    state: &Arc<SharedState>,
-    gain: f64,
-) {
-    if w < 1.0 {
-        return;
-    }
-    let n_columns = w.floor() as usize;
-    if n_columns == 0 {
-        return;
-    }
+    rounded_rectangle(cr, pill_x, pill_y, pill_w, pill_h, radius);
+    cr.set_source_rgba(
+        style.palette.background.r as f64,
+        style.palette.background.g as f64,
+        style.palette.background.b as f64,
+        (style.palette.background.a as f64 * style.opacity).clamp(0.0, 1.0),
+    );
+    cr.fill().ok();
 
-    // Collect frames as a Vec snapshot under the lock, then drop.
     let frames: Vec<AudioFrame> = match state.ring.lock() {
         Ok(r) => r.iter().collect(),
         Err(_) => return,
     };
-    let cols = project_envelope(&frames, n_columns);
-
-    let mid = y + h * 0.5;
-    let half = h * 0.5;
-
-    // Mirrored envelope filled polygon. We trace the top edge left-to-right
-    // following `max`, then the bottom edge right-to-left following `min`.
-    cr.set_source_rgba(
-        palette.accent.r as f64,
-        palette.accent.g as f64,
-        palette.accent.b as f64,
-        palette.accent.a as f64,
+    let targets = project_pill_levels(
+        &frames,
+        PILL_BAR_COUNT,
+        PILL_RECENT_FRAMES,
+        style.gain * PILL_GAIN_SCALE,
     );
+    let mut animation = animation.borrow_mut();
+    animation.approach(&targets);
 
-    cr.new_path();
-    // Top edge.
-    for (i, col) in cols.iter().enumerate() {
-        let px = x + i as f64 + 0.5;
-        let py = mid - sample_to_pixels(col.max, half, gain);
-        if i == 0 {
-            cr.move_to(px, py);
-        } else {
-            cr.line_to(px, py);
-        }
-    }
-    // Bottom edge, right-to-left.
-    for (i, col) in cols.iter().enumerate().rev() {
-        let px = x + i as f64 + 0.5;
-        let py = mid - sample_to_pixels(col.min, half, gain);
-        cr.line_to(px, py);
-    }
-    cr.close_path();
-    cr.fill().ok();
+    let horizontal_padding = (pill_h * 0.38).max(14.0);
+    let bars_x = pill_x + horizontal_padding;
+    let bars_w = (pill_w - horizontal_padding * 2.0).max(1.0);
+    let bar_w = (pill_h * 0.095).clamp(4.0, 6.0);
+    let gap = ((bars_w - bar_w * PILL_BAR_COUNT as f64) / PILL_BAR_COUNT.saturating_sub(1) as f64)
+        .max(2.0);
+    let total_w = bar_w * PILL_BAR_COUNT as f64 + gap * PILL_BAR_COUNT.saturating_sub(1) as f64;
+    let start_x = bars_x + (bars_w - total_w) * 0.5;
+    let center_y = pill_y + pill_h * 0.5;
+    let min_bar_h = (pill_h * 0.13).max(bar_w);
+    let max_bar_h = pill_h * 0.68;
 
-    // Subtle centerline.
     cr.set_source_rgba(
-        palette.foreground.r as f64,
-        palette.foreground.g as f64,
-        palette.foreground.b as f64,
-        0.15,
+        style.palette.foreground.r as f64,
+        style.palette.foreground.g as f64,
+        style.palette.foreground.b as f64,
+        0.96,
     );
-    cr.set_line_width(1.0);
-    cr.move_to(x, mid);
-    cr.line_to(x + w, mid);
-    cr.stroke().ok();
-}
-
-fn sample_to_pixels(sample: f32, half_height: f64, gain: f64) -> f64 {
-    // Apply visual gain, then clamp to -1.0..=1.0, then scale to half_height.
-    let s = (sample as f64 * gain).clamp(-1.0, 1.0);
-    s * half_height
-}
-
-fn draw_peak_meter(
-    cr: &Context,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    palette: &Palette,
-    state: &Arc<SharedState>,
-) {
-    if w < 1.0 || h < 1.0 {
-        return;
-    }
-
-    let (latest_peak, held_peak) = {
-        let latest = state
-            .ring
-            .lock()
-            .ok()
-            .and_then(|r| r.latest())
-            .map(|f| f.peak_dbfs)
-            .unwrap_or(f32::NEG_INFINITY);
-        let held = state
-            .peak
-            .lock()
-            .map(|p| p.held_dbfs)
-            .unwrap_or(f32::NEG_INFINITY);
-        (latest, held)
-    };
-
-    let fill_frac = peak_meter_fraction(latest_peak, METER_FLOOR_DBFS) as f64;
-
-    let segments = METER_SEGMENTS;
-    let gap = 1.5_f64;
-    let total_gap = gap * (segments as f64 - 1.0);
-    let seg_h = ((h - total_gap) / segments as f64).max(1.0);
-
-    for i in 0..segments {
-        // Segment 0 is the bottom of the bar.
-        let frac_top = (i as f64 + 1.0) / segments as f64;
-        let lit = fill_frac >= (i as f64 + 0.5) / segments as f64;
-        // dBFS at the *top* of this segment for color zone classification.
-        let seg_top_db = METER_FLOOR_DBFS + (frac_top as f32) * (-METER_FLOOR_DBFS);
-        let zone = MeterZone::from_dbfs(seg_top_db);
-        let zone_color = zone.color(palette);
-
-        let py = y + h - (i as f64 + 1.0) * seg_h - i as f64 * gap;
-
-        if lit {
-            cr.set_source_rgba(
-                zone_color.r as f64,
-                zone_color.g as f64,
-                zone_color.b as f64,
-                zone_color.a as f64,
-            );
-        } else {
-            cr.set_source_rgba(
-                zone_color.r as f64,
-                zone_color.g as f64,
-                zone_color.b as f64,
-                0.18,
-            );
-        }
-        cr.rectangle(x, py, w, seg_h);
+    for (index, level) in animation.levels.iter().enumerate() {
+        let bar_h = min_bar_h + (max_bar_h - min_bar_h) * f64::from(*level);
+        let x = start_x + index as f64 * (bar_w + gap);
+        let y = center_y - bar_h * 0.5;
+        rounded_rectangle(cr, x, y, bar_w, bar_h, bar_w * 0.5);
         cr.fill().ok();
     }
+}
 
-    // Held-peak tick (1.5 px line at the held position).
-    if held_peak.is_finite() && held_peak > METER_FLOOR_DBFS {
-        let held_frac = peak_meter_fraction(held_peak, METER_FLOOR_DBFS) as f64;
-        let py = y + h - held_frac * h;
-        cr.set_source_rgba(
-            palette.foreground.r as f64,
-            palette.foreground.g as f64,
-            palette.foreground.b as f64,
-            0.95,
-        );
-        cr.set_line_width(1.5);
-        cr.move_to(x, py);
-        cr.line_to(x + w, py);
-        cr.stroke().ok();
-    }
+fn rounded_rectangle(cr: &Context, x: f64, y: f64, w: f64, h: f64, radius: f64) {
+    let radius = radius.min(w * 0.5).min(h * 0.5).max(0.0);
+    let right = x + w;
+    let bottom = y + h;
+
+    cr.new_sub_path();
+    cr.arc(
+        right - radius,
+        y + radius,
+        radius,
+        -std::f64::consts::FRAC_PI_2,
+        0.0,
+    );
+    cr.arc(
+        right - radius,
+        bottom - radius,
+        radius,
+        0.0,
+        std::f64::consts::FRAC_PI_2,
+    );
+    cr.arc(
+        x + radius,
+        bottom - radius,
+        radius,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+    );
+    cr.arc(
+        x + radius,
+        y + radius,
+        radius,
+        std::f64::consts::PI,
+        std::f64::consts::PI + std::f64::consts::FRAC_PI_2,
+    );
+    cr.close_path();
 }
