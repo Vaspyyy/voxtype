@@ -89,6 +89,12 @@ const PILL_RECENT_FRAMES: usize = 44;
 /// before the pill's response curve so normal speech has useful headroom.
 const PILL_GAIN_SCALE: f32 = 0.45;
 
+/// Subtle inner edge that keeps the charcoal pill visible on dark surfaces.
+const PILL_RIM_WIDTH: f64 = 1.0;
+const PILL_RIM_ALPHA: f64 = 0.20;
+const PILL_RIM_EDGE_GAP: f64 = 1.0;
+const PILL_SHADOW_OFFSET: f64 = 1.0;
+
 struct PillAnimation {
     levels: Vec<f32>,
 }
@@ -587,7 +593,17 @@ fn draw(
     let pill_h = (h - inset * 2.0).max(1.0);
     let radius = pill_h * 0.5;
 
-    rounded_rectangle(cr, pill_x, pill_y + 1.0, pill_w, pill_h, radius);
+    // Keep the downward offset, but cap the shadow at the pill's own bottom
+    // edge. Letting it extend one row farther leaves a translucent-black
+    // surface fringe that some compositors present as a gray strip.
+    rounded_rectangle(
+        cr,
+        pill_x,
+        pill_y + PILL_SHADOW_OFFSET,
+        pill_w,
+        (pill_h - PILL_SHADOW_OFFSET).max(1.0),
+        radius,
+    );
     cr.set_source_rgba(0.0, 0.0, 0.0, 0.22 * style.opacity.clamp(0.0, 1.0));
     cr.fill().ok();
 
@@ -599,6 +615,27 @@ fn draw(
         (style.palette.background.a as f64 * style.opacity).clamp(0.0, 1.0),
     );
     cr.fill().ok();
+
+    // Keep one charcoal pixel outside the half-pixel-aligned rim. Without
+    // that gap, the bottom stroke occupies the pill's final visible row and
+    // reads as a detached horizontal strip after compositing.
+    let rim_inset = PILL_RIM_EDGE_GAP + PILL_RIM_WIDTH * 0.5;
+    rounded_rectangle(
+        cr,
+        pill_x + rim_inset,
+        pill_y + rim_inset,
+        pill_w - rim_inset * 2.0,
+        pill_h - rim_inset * 2.0,
+        (radius - rim_inset).max(0.0),
+    );
+    cr.set_source_rgba(
+        style.palette.foreground.r as f64,
+        style.palette.foreground.g as f64,
+        style.palette.foreground.b as f64,
+        PILL_RIM_ALPHA,
+    );
+    cr.set_line_width(PILL_RIM_WIDTH);
+    cr.stroke().ok();
 
     let frames: Vec<AudioFrame> = match state.ring.lock() {
         Ok(r) => r.iter().collect(),
@@ -675,4 +712,52 @@ fn rounded_rectangle(cr: &Context, x: f64, y: f64, w: f64, h: f64, radius: f64) 
         std::f64::consts::PI + std::f64::consts::FRAC_PI_2,
     );
     cr.close_path();
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use cairo::{Format, ImageSurface};
+
+    #[test]
+    fn rim_stays_inside_filled_pill_edge() {
+        const WIDTH: i32 = 280;
+        const HEIGHT: i32 = 56;
+
+        let mut surface = ImageSurface::create(Format::ARgb32, WIDTH, HEIGHT).unwrap();
+        let cr = Context::new(&surface).unwrap();
+        let state = Arc::new(SharedState::new(6.0));
+        let animation = Rc::new(RefCell::new(PillAnimation::new()));
+        let style = PillStyle {
+            palette: Palette::fallback(),
+            gain: 8.0,
+            opacity: 0.92,
+        };
+
+        draw(&cr, WIDTH, HEIGHT, &state, &animation, &style);
+        drop(cr);
+        surface.flush();
+
+        let stride = surface.stride() as usize;
+        let data = surface.data().unwrap();
+        let pixel = |x: usize, y: usize| {
+            let offset = y * stride + x * 4;
+            <[u8; 4]>::try_from(&data[offset..offset + 4]).unwrap()
+        };
+
+        let center = WIDTH as usize / 2;
+        let body = pixel(center, 10);
+        let rim = pixel(center, 52);
+        let bottom_edge = pixel(center, 53);
+        let fringe_pixels = (0..WIDTH as usize)
+            .filter(|&x| pixel(x, 54)[3] != 0)
+            .count();
+
+        assert_eq!(&bottom_edge[..3], &body[..3]);
+        assert!(
+            rim[0] > bottom_edge[0] + 20,
+            "body={body:?} rim={rim:?} bottom_edge={bottom_edge:?}"
+        );
+        assert_eq!(fringe_pixels, 0);
+    }
 }
